@@ -17,7 +17,6 @@ def home():
 def webhook():
     try:
         data = request.get_json()
-        print(f"WEBHOOK HIT: {data}", flush=True)
         cq = data.get("callback_query")
         if cq:
             d = cq.get("data")
@@ -30,19 +29,17 @@ def webhook():
             if msg in ["NIFTY","BANKNIFTY"]:
                 threading.Thread(target=send_signal, args=(msg,), daemon=True).start()
     except Exception as e:
-        print(f"Webhook error {e}", flush=True)
+        print(f"Err {e}", flush=True)
     return "OK"
 
 def send_tg(msg, kb=None):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         data = {"chat_id": CHAT_ID, "text": msg}
-        if kb:
-            data["reply_markup"] = json.dumps(kb)
+        if kb: data["reply_markup"] = json.dumps(kb)
         r = requests.post(url, data=data, timeout=10)
-        print(f"SEND TG RESULT: {r.text}", flush=True)
-    except Exception as e:
-        print(f"Send fail {e}", flush=True)
+        print(f"SEND: {r.text}", flush=True)
+    except Exception as e: print(f"Send fail {e}", flush=True)
 
 def menu():
     kb = {"inline_keyboard": [[{"text":"📈 NIFTY","callback_data":"NIFTY"},{"text":"🏦 BANKNIFTY","callback_data":"BANKNIFTY"}]]}
@@ -53,43 +50,48 @@ def get_spot(sym):
         m = {"NIFTY":"^NSEI","BANKNIFTY":"^NSEBANK"}
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{m[sym]}?interval=1m&range=1d", headers={"User-Agent":"Mozilla/5.0"}, timeout=5).json()
         return float(r['chart']['result'][0]['meta']['regularMarketPrice'])
-    except:
-        return 23431.5 if sym=="NIFTY" else 56295.55
+    except: return 23431.5 if sym=="NIFTY" else 56295.55
 
 def get_price(sym, spot):
     atm = round(spot / (100 if sym=="BANKNIFTY" else 50)) * (100 if sym=="BANKNIFTY" else 50)
+    # Try NSE live CE price - nee screenshot la 138.50 ravali
     try:
-        nse_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
-        enc = urllib.parse.quote(nse_url, safe='')
-        r = requests.get(f"https://api.allorigins.win/raw?url={enc}", timeout=8)
-        if r.status_code==200:
-            for row in r.json().get('records',{}).get('data',[]):
-                if row.get('strikePrice')==atm and row.get('CE',{}).get('lastPrice',0)>5:
-                    return float(row['CE']['lastPrice']), atm
-    except: pass
-    est = 800 + (spot-56295)*0.8 if sym=="BANKNIFTY" else 120 + (spot-23431)*0.5
-    return round(max(30, est),1), atm
+        s = requests.Session()
+        s.headers.update({"User-Agent":"Mozilla/5.0","Accept":"application/json","Referer":"https://www.nseindia.com/option-chain"})
+        s.get("https://www.nseindia.com/option-chain", timeout=5)
+        time.sleep(1)
+        r = s.get(f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}", timeout=5).json()
+        for row in r.get('records',{}).get('data',[]):
+            if row.get('strikePrice')==atm:
+                ce = row.get('CE',{}).get('lastPrice')
+                if ce and ce>5:
+                    print(f"NSE LIVE PRICE {sym} {atm} = {ce}", flush=True)
+                    return float(ce), atm
+    except Exception as e: print(f"NSE Fail {e}", flush=True)
+    return None, atm
 
 def send_signal(sym):
     spot = get_spot(sym)
     price, strike = get_price(sym, spot)
+    if price is None:
+        send_tg(f"⚠️ {sym} {strike} CE - Market close ayindi mowa! Live price ledu. Repu 9:15 ki try chey.\n\n📍 SPOT: {spot}\n⏰ {datetime.now(IST).strftime('%H:%M:%S')} IST")
+        menu(); return
     sl=int(price*0.75); t1=int(price*1.10); t2=int(price*1.20); t3=int(price*1.30)
     now = datetime.now(IST).strftime('%H:%M:%S')
-    msg = f"🔥 {sym} {strike} CE\n\n💰 ENTRY: {price}\n🛑 SL: {sl}\n🎯 T1: {t1}\n🎯 T2: {t2}\n🎯 T3: {t3}\n\n📍 SPOT: {spot}\n⏰ {now} IST"
-    send_tg(msg)
-    menu()
+    # CMP LOGIC
+    msg = f"🔥 {sym} {strike} CE - BUY AT CMP\n\n💰 CMP: {price}\n🛑 SL: {sl}\n🎯 T1: {t1}\n🎯 T2: {t2}\n🎯 T3: {t3}\n\n📍 SPOT: {spot}\n⏰ {now} IST\n\n✅ Ippude konali mowa!"
+    send_tg(msg); menu()
 
 def auto_set_webhook():
     time.sleep(2)
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={MY_URL}/webhook"
         r = requests.get(url, timeout=10).json()
-        print(f"WEBHOOK SET RESULT === {r}", flush=True)
-    except Exception as e:
-        print(f"WEBHOOK FAIL {e}", flush=True)
+        print(f"WEBHOOK SET {r}", flush=True)
+    except Exception as e: print(f"WH Fail {e}", flush=True)
 
 threading.Thread(target=auto_set_webhook, daemon=True).start()
-print("=== BOT STARTED ===", flush=True)
+print("=== BOT STARTED CMP MODE ===", flush=True)
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
