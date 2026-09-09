@@ -1,16 +1,17 @@
 import os, requests, threading, time, json, urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 MY_URL = "https://sensex-bot-b7b7.onrender.com"
+IST = timezone(timedelta(hours=5, minutes=30))
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"BOT LIVE {datetime.now().strftime('%H:%M:%S')}"
+    return f"BOT LIVE {datetime.now(IST).strftime('%H:%M:%S')} IST"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -53,7 +54,7 @@ def get_spot(sym):
         r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{m[sym]}?interval=1m&range=1d", headers={"User-Agent":"Mozilla/5.0"}, timeout=5).json()
         return float(r['chart']['result'][0]['meta']['regularMarketPrice'])
     except:
-        return 23472.0 if sym=="NIFTY" else 56433.0
+        return 23431.5 if sym=="NIFTY" else 56295.55
 
 def get_price(sym, spot):
     atm = round(spot / (100 if sym=="BANKNIFTY" else 50)) * (100 if sym=="BANKNIFTY" else 50)
@@ -66,14 +67,15 @@ def get_price(sym, spot):
                 if row.get('strikePrice')==atm and row.get('CE',{}).get('lastPrice',0)>5:
                     return float(row['CE']['lastPrice']), atm
     except: pass
-    est = 800 + (spot-56433)*0.8 if sym=="BANKNIFTY" else 140 + (spot-23472)*0.5
+    est = 800 + (spot-56295)*0.8 if sym=="BANKNIFTY" else 120 + (spot-23431)*0.5
     return round(max(30, est),1), atm
 
 def send_signal(sym):
     spot = get_spot(sym)
     price, strike = get_price(sym, spot)
     sl=int(price*0.75); t1=int(price*1.10); t2=int(price*1.20); t3=int(price*1.30)
-    msg = f"🔥 {sym} {strike} CE\n\n💰 ENTRY: {price}\n🛑 SL: {sl}\n🎯 T1: {t1}\n🎯 T2: {t2}\n🎯 T3: {t3}\n\n📍 SPOT: {spot}\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+    now = datetime.now(IST).strftime('%H:%M:%S')
+    msg = f"🔥 {sym} {strike} CE\n\n💰 ENTRY: {price}\n🛑 SL: {sl}\n🎯 T1: {t1}\n🎯 T2: {t2}\n🎯 T3: {t3}\n\n📍 SPOT: {spot}\n⏰ {now} IST"
     send_tg(msg)
     menu()
 
