@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "BOT LIVE 40% AIM - " + datetime.now().strftime('%H:%M:%S')
+    return "BOT LIVE SL25 T10-30 - " + datetime.now().strftime('%H:%M:%S')
 
 @app.route('/test')
 def test():
@@ -34,7 +34,7 @@ def send_menu():
             [{"text": "🔥 SENSEX", "callback_data": "SENSEX"}, {"text": "🧪 TEST", "callback_data": "TEST"}]
         ]
     }
-    send_tg("👇 *SELECT INDEX (40% AIM):*", keyboard)
+    send_tg("👇 *SELECT INDEX (SL 25% | T1 10% T2 20% T3 30%):*", keyboard)
 
 def get_spot_yahoo(symbol):
     try:
@@ -56,7 +56,6 @@ def get_momentum(symbol):
         closes = r['chart']['result'][0]['indicators']['quote'][0]['close']
         closes = [c for c in closes if c]
         if len(closes) < 3: return 0
-        # last 2 candles change
         pct = (closes[-1] - closes[-2]) / closes[-2] * 100
         return pct
     except:
@@ -64,13 +63,11 @@ def get_momentum(symbol):
 
 def get_nse_signals(symbol, spot):
     try:
-        # 1. MOMENTUM FILTER - 0.12% kanna thakkuva unte skip
         mom = get_momentum(symbol)
-        if abs(mom) < 0.12:
-            print(f"SKIP {symbol} WEAK MOM {mom}")
+        if abs(mom) < 0.10: # 0.10% kanna thakkuva ante skip
+            print(f"SKIP {symbol} WEAK MOM {mom:.3f}")
             return []
 
-        # 2. NSE FETCH
         headers = {"User-Agent": "Mozilla/5.0 Chrome/120.0", "Accept": "application/json", "Referer": "https://www.nseindia.com/option-chain"}
         s = requests.Session()
         s.headers.update(headers)
@@ -84,7 +81,6 @@ def get_nse_signals(symbol, spot):
             time.sleep(2)
             r = s.get(url, timeout=15)
         if r.status_code!= 200:
-            print(f"NSE FAIL {symbol}")
             return []
 
         data = r.json()
@@ -94,13 +90,11 @@ def get_nse_signals(symbol, spot):
             if abs(row.get('strikePrice',0) - atm) <= 100:
                 ce = row.get('CE')
                 pe = row.get('PE')
-                # CE - UP momentum
                 if mom > 0 and ce and 80 <= ce.get('lastPrice',0) <= 280:
-                    if ce.get('pChange',0) > 0 and ce.get('totalTradedVolume',0) > 1000:
+                    if ce.get('pChange',0) > -2 and ce.get('totalTradedVolume',0) > 500:
                         return [("CE", row['strikePrice'], ce['lastPrice'], mom)]
-                # PE - DOWN momentum
                 if mom < 0 and pe and 80 <= pe.get('lastPrice',0) <= 280:
-                    if pe.get('pChange',0) > 0 and pe.get('totalTradedVolume',0) > 1000:
+                    if pe.get('pChange',0) > -2 and pe.get('totalTradedVolume',0) > 500:
                         return [("PE", row['strikePrice'], pe['lastPrice'], mom)]
         return []
     except Exception as e:
@@ -108,14 +102,15 @@ def get_nse_signals(symbol, spot):
         return []
 
 def format_signal(sym, typ, strike, price, spot, mom):
-    sl = int(price * 0.65) # -35% SL
-    t1 = int(price * 1.40) # +40%
-    t2 = int(price * 1.55) # +55%
-    return f"🔥 *{sym} {strike} {typ} - 40% AIM*\n\n💰 ENTRY: {price}\n🛑 SL: {sl} (-35%)\n🎯 T1: {t1} (+40%)\n🎯 T2: {t2} (+55%)\n\n📍 SPOT: {spot}\n📊 MOM: {mom:.2f}% {'🟢' if mom>0 else '🔴'}\n⏰ {datetime.now().strftime('%H:%M:%S')}\n\n_⚠️ Paper trade first, not financial advice_"
+    sl = int(price * 0.75) # SL 25%
+    t1 = int(price * 1.10) # T1 10%
+    t2 = int(price * 1.20) # T2 20%
+    t3 = int(price * 1.30) # T3 30%
+    return f"🔥 *{sym} {strike} {typ}*\n\n💰 ENTRY: {price}\n🛑 SL: {sl} (-25%)\n🎯 T1: {t1} (+10%)\n🎯 T2: {t2} (+20%)\n🎯 T3: {t3} (+30%)\n\n📍 SPOT: {spot}\n📊 MOM: {mom:.2f}% {'🟢 UP' if mom>0 else '🔴 DOWN'}\n⏰ {datetime.now().strftime('%H:%M:%S')}\n\n_Book 50% at T1, rest trail_"
 
 def bot_loop():
     time.sleep(10)
-    send_tg("✅ *BOT LIVE - 40% PROFIT AIM MODE*\n\nFilter: Momentum + OI + 80-280rs premium\nRojuki 3-6 quality signals vastai!")
+    send_tg("✅ *BOT LIVE - SL 25% | PROFIT 10-20-30% MODE*\n\nQuality filter ON, prati 3 mins ki check!")
     time.sleep(2)
     send_menu()
     while True:
@@ -123,7 +118,6 @@ def bot_loop():
             for sym in ["NIFTY", "BANKNIFTY"]:
                 spot = get_spot_yahoo(sym)
                 if not spot: continue
-                print(f"CHECK {sym} {spot}")
                 sigs = get_nse_signals(sym, spot)
                 if sigs:
                     for typ, strike, price, mom in sigs:
@@ -145,21 +139,21 @@ def tg_polling():
                 cq=upd.get("callback_query")
                 if cq:
                     data=cq.get("data")
-                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id": cq["id"], "text": f"{data} Checking..."})
+                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id": cq["id"], "text": f"{data}..."})
                     if data=="TEST":
                         n=get_spot_yahoo("NIFTY"); b=get_spot_yahoo("BANKNIFTY")
-                        send_tg(f"🧪 *TEST OK - 40% MODE*\n\n📈 NIFTY: {n}\n🏦 BANKNIFTY: {b}\n\nBot ready!")
+                        send_tg(f"🧪 *TEST OK - SL25 T10-30*\n\n📈 NIFTY: {n}\n🏦 BANKNIFTY: {b}")
                     elif data in ["NIFTY","BANKNIFTY","SENSEX"]:
                         spot=get_spot_yahoo(data)
                         if not spot:
-                            send_tg("⚠️ Spot fail, retry")
+                            send_tg("⚠️ Spot fail")
                             continue
                         sigs=get_nse_signals(data, spot) if data!="SENSEX" else []
                         if sigs:
                             typ,strike,price,mom=sigs[0]
                             send_tg(format_signal(data, typ, strike, price, spot, mom))
                         else:
-                            send_tg(f"📍 *{data} SPOT: {spot}*\n\nIppudu strong momentum ledu, 40% kosam wait chestunna. Auto lo vastadi.")
+                            send_tg(f"📍 *{data} SPOT: {spot}*\n\nIppudu momentum weak, next 3 mins lo auto vastadi mowa.")
                     send_menu()
             time.sleep(2)
         except Exception as e:
