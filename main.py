@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "BOT LIVE - SL25 T10-30 - " + datetime.now().strftime('%H:%M:%S')
+    return "BOT LIVE REAL STRIKES - " + datetime.now().strftime('%H:%M:%S')
 
 @app.route('/test')
 def test():
@@ -33,75 +33,84 @@ def send_menu():
             [{"text": "🔥 SENSEX", "callback_data": "SENSEX"}, {"text": "🧪 TEST", "callback_data": "TEST"}]
         ]
     }
-    send_tg("👇 *SELECT - PAKKA SIGNAL VASTADI:*", keyboard)
+    send_tg("👇 *SELECT - REAL STRIKE REAL PRICE:*", keyboard)
 
-def get_spot_yahoo(symbol):
+def get_spot(symbol):
     try:
-        y_map = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN"}
-        y_sym = y_map.get(symbol, "^NSEI")
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{y_sym}?interval=1m&range=1d"
+        m = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN"}
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{m.get(symbol,'^NSEI')}?interval=1m&range=1d"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
         price = float(r['chart']['result'][0]['meta']['regularMarketPrice'])
+        print(f"SPOT {symbol} = {price}")
         return price
     except Exception as e:
-        print(f"Yahoo fail {e}")
+        print(f"Spot fail {e}")
         return None
 
-def get_signals(symbol, spot):
-    # TRY REAL NSE
+def get_real_price(symbol, spot):
     try:
-        headers = {"User-Agent": "Mozilla/5.0 Chrome/120.0", "Accept": "application/json", "Referer": "https://www.nseindia.com/option-chain"}
-        s = requests.Session()
-        s.headers.update(headers)
-        s.get("https://www.nseindia.com", timeout=15)
-        time.sleep(1)
-        s.get("https://www.nseindia.com/option-chain", timeout=15)
-        time.sleep(1)
-        r = s.get(f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}", timeout=15)
+        import cloudscraper
+        scraper = cloudscraper.create_scraper(browser={'browser':'chrome','platform':'windows'})
+        scraper.get("https://www.nseindia.com", timeout=15)
+        time.sleep(1.5)
+        scraper.get("https://www.nseindia.com/option-chain", timeout=15)
+        time.sleep(1.5)
+        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+        r = scraper.get(url, timeout=15)
+        print(f"NSE {symbol} Status {r.status_code} SPOT {spot}")
+
         if r.status_code == 200:
             data = r.json()
-            atm = round(spot / 50) * 50
+            step = 100 if symbol == "BANKNIFTY" else 50
+            atm = round(spot / step) * step
+            print(f"Calculated ATM {symbol} = {atm}")
+
+            # Exact ATM
             for row in data['records']['data']:
                 if row.get('strikePrice',0) == atm:
                     ce = row.get('CE')
-                    if ce and ce.get('lastPrice',0) > 5:
-                        return [(ce.get('lastPrice',0), atm, True)]
-                    pe = row.get('PE')
-                    if pe and pe.get('lastPrice',0) > 5:
-                        return [(pe.get('lastPrice',0), atm, True)]
+                    if ce and ce.get('lastPrice',0) > 2:
+                        print(f"FOUND REAL {symbol} {atm} CE = {ce['lastPrice']}")
+                        return ce['lastPrice'], atm, "CE", True
+
+            # Nearest strike
+            for row in data['records']['data']:
+                if abs(row.get('strikePrice',0) - atm) <= step:
+                    ce = row.get('CE')
+                    if ce and ce.get('lastPrice',0) > 2:
+                        print(f"FOUND NEAREST {symbol} {row['strikePrice']} CE = {ce['lastPrice']}")
+                        return ce['lastPrice'], row['strikePrice'], "CE", True
     except Exception as e:
-        print(f"NSE fail {e}")
+        print(f"NSE Error {symbol}: {e}")
 
-    # FALLBACK - NSE blocked ayina signal ivvu
-    atm = round(spot / 50) * 50
-    est_price = 135 if symbol == "NIFTY" else 180
-    return [(est_price, atm, False)]
+    # No fake 180/135 - return None to avoid wrong signal
+    return None, None, None, False
 
-def format_signal(sym, strike, price, spot, is_real):
+def format_msg(sym, strike, price, spot, typ, is_real):
     sl = int(price * 0.75) # -25%
     t1 = int(price * 1.10) # +10%
     t2 = int(price * 1.20) # +20%
     t3 = int(price * 1.30) # +30%
-    src = "LIVE NSE" if is_real else "ESTIMATED (NSE blocked by Render)"
-    return f"🔥 *{sym} {strike} CE*\n\n💰 ENTRY: {price}\n🛑 SL: {sl} (-25%)\n🎯 T1: {t1} (+10%)\n🎯 T2: {t2} (+20%)\n🎯 T3: {t3} (+30%)\n\n📍 SPOT: {spot}\n📦 {src}\n⏰ {datetime.now().strftime('%H:%M:%S')}\n\n_Book 50% at T1_"
+    src = "✅ NSE REAL" if is_real else "⚠️ ESTIMATED"
+    return f"🔥 *{sym} {strike} {typ}*\n\n💰 ENTRY: {price}\n🛑 SL: {sl} (-25%)\n🎯 T1: {t1} (+10%)\n🎯 T2: {t2} (+20%)\n🎯 T3: {t3} (+30%)\n\n📍 SPOT: {spot}\n📦 {src}\n⏰ {datetime.now().strftime('%H:%M:%S')}\n\n_Book 50% at T1_"
 
 def bot_loop():
     time.sleep(10)
-    send_tg("✅ *BOT LIVE - SL 25% / T 10-30%*\n\nIppudu NSE block ayina kooda signals vastai mowa!")
+    send_tg("✅ *BOT FIXED - BANKNIFTY STRIKE CORRECTED*\n\nNIFTY = 50 step (23550)\nBANKNIFTY = 100 step (56700)\nReal price only, fake 180 raadu!")
     send_menu()
     while True:
         try:
             for sym in ["NIFTY", "BANKNIFTY"]:
-                spot = get_spot_yahoo(sym)
+                spot = get_spot(sym)
                 if not spot: continue
-                sigs = get_signals(sym, spot)
-                if sigs:
-                    price, strike, is_real = sigs[0]
-                    send_tg(format_signal(sym, strike, price, spot, is_real))
-                    time.sleep(2)
+                price, strike, typ, is_real = get_real_price(sym, spot)
+                if price:
+                    send_tg(format_msg(sym, strike, price, spot, typ, is_real))
+                else:
+                    print(f"Skipping {sym} - no real price to avoid fake 56650/180")
             time.sleep(180)
         except Exception as e:
-            print(f"Loop error {e}")
+            print(f"Loop Error {e}")
             time.sleep(60)
 
 def tg_polling():
@@ -117,20 +126,19 @@ def tg_polling():
                     data = cq.get("data")
                     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id": cq["id"], "text": f"{data}..."})
                     if data == "TEST":
-                        n = get_spot_yahoo("NIFTY")
-                        send_tg(f"🧪 *BOT OK*\n\nNIFTY SPOT: {n}\n\nNIFTY button nokku, signal vastadi!")
+                        n = get_spot("NIFTY"); b = get_spot("BANKNIFTY")
+                        send_tg(f"🧪 *REAL MODE TEST*\n\n📈 NIFTY SPOT: {n} -> ATM {round(n/50)*50}\n🏦 BANKNIFTY SPOT: {b} -> ATM {round(b/100)*100}\n\nCorrect strikes vastai!")
                     elif data in ["NIFTY", "BANKNIFTY", "SENSEX"]:
-                        spot = get_spot_yahoo(data)
-                        if spot:
-                            price, strike, is_real = get_signals(data, spot)[0]
-                            send_tg(format_signal(data, strike, price, spot, is_real))
+                        spot = get_spot(data)
+                        price, strike, typ, is_real = get_real_price(data, spot)
+                        if price:
+                            send_tg(format_msg(data, strike, price, spot, typ, is_real))
                         else:
-                            send_tg("Spot fail, malli try chey")
+                            send_tg(f"📍 *{data} SPOT: {spot}*\n\nNSE block avtondi, 1 min lo malli nokku mowa. Thappu strike ivvanu.")
                     send_menu()
             time.sleep(2)
         except Exception as e:
-            print(f"Poll error {e}")
-            time.sleep(5)
+            print(f"Poll Error {e}"); time.sleep(5)
 
 threading.Thread(target=bot_loop, daemon=True).start()
 threading.Thread(target=tg_polling, daemon=True).start()
