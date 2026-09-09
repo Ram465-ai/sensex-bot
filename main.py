@@ -1,4 +1,4 @@
-import os, requests, time, threading, json
+import os, requests, time, threading, json, urllib.parse
 from datetime import datetime
 from flask import Flask
 
@@ -7,9 +7,9 @@ CHAT_ID = os.getenv("CHAT_ID")
 app = Flask(__name__)
 
 @app.route('/')
-def home(): return "BOT GROWW REAL - " + datetime.now().strftime('%H:%M:%S')
+def home(): return "BOT LIVE - " + datetime.now().strftime('%H:%M:%S')
 @app.route('/test')
-def test(): send_menu(); return "MENU SENT"
+def test(): send_menu(); return "OK"
 
 def send_tg(msg, reply_markup=None):
     try:
@@ -17,95 +17,67 @@ def send_tg(msg, reply_markup=None):
         data = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
         if reply_markup: data["reply_markup"] = json.dumps(reply_markup)
         requests.post(url, data=data, timeout=20)
-    except Exception as e:
-        print(f"TG Error {e}")
+    except: pass
 
 def send_menu():
     kb = {"inline_keyboard": [[{"text":"📈 NIFTY","callback_data":"NIFTY"},{"text":"🏦 BANKNIFTY","callback_data":"BANKNIFTY"}],[{"text":"🔥 SENSEX","callback_data":"SENSEX"},{"text":"🧪 TEST","callback_data":"TEST"}]]}
-    send_tg("👇 *GROWW REAL MODE - SELECT:*", kb)
+    send_tg("👇 *SELECT:*", kb)
 
-def get_spot_and_real_option(symbol, spot):
-    step = 100 if symbol == "BANKNIFTY" else 50
+def get_spot(symbol):
+    try:
+        m = {"NIFTY":"^NSEI","BANKNIFTY":"^NSEBANK"}
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{m.get(symbol,'^NSEI')}?interval=1m&range=1d"
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10).json()
+        return float(r['chart']['result'][0]['meta']['regularMarketPrice'])
+    except: return None
+
+def get_real(symbol, spot):
+    step = 100 if symbol=="BANKNIFTY" else 50
     atm = round(spot / step) * step
-    print(f"Need {symbol} ATM {atm} SPOT {spot}")
-
-    # ===== METHOD 1: GROWW REAL OPTION CHAIN API =====
+    nse_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    encoded = urllib.parse.quote(nse_url, safe='')
     try:
-        # Groww expiry API
-        groww_symbol = "NIFTY" if symbol=="NIFTY" else "BANKNIFTY"
-        # Get expiry list
-        exp_url = f"https://groww.in/v1/api/option_chain_service/v1/option_chain/expiry?exchange=NSE&segment=FNO&symbol={groww_symbol}"
-        exp_r = requests.get(exp_url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10).json()
-        expiry = exp_r.get('expiries', [{}])[0].get('expiryDate') if exp_r.get('expiries') else "2025-09-29"
-        if not expiry:
-            # fallback from your screenshot date
-            expiry = "2025-09-29" if symbol=="BANKNIFTY" else "2025-09-30"
-
-        # Option chain
-        chain_url = f"https://groww.in/v1/api/option_chain_service/v1/option_chain?exchange=NSE&segment=FNO&symbol={groww_symbol}&expiry={expiry}"
-        r = requests.get(chain_url, headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"}, timeout=15).json()
-
-        options = r.get('optionChain', []) or r.get('data', {}).get('optionChain', [])
-        for opt in options:
-            if opt.get('strikePrice') == atm:
-                ce = opt.get('callOption') or opt.get('CE') or {}
-                price = ce.get('lastPrice') or ce.get('ltp')
-                if price and float(price) > 5:
-                    print(f"GROWW REAL {symbol} {atm} CE = {price}")
-                    return float(price), atm, "CE", True
-    except Exception as e:
-        print(f"Groww API fail {e}")
-
-    # ===== METHOD 2: NSE via PROXY (AllOrigins) - Bypass Render block =====
-    try:
-        proxy_url = f"https://api.allorigins.win/raw?url=https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        r = requests.get(proxy_url, timeout=15)
+        url = f"https://api.allorigins.win/raw?url={encoded}"
+        r = requests.get(url, timeout=15)
         if r.status_code == 200:
             data = r.json()
             for row in data['records']['data']:
                 if row.get('strikePrice') == atm:
                     ce = row.get('CE')
-                    if ce and ce.get('lastPrice',0) > 5:
-                        print(f"PROXY NSE REAL {symbol} {atm} = {ce['lastPrice']}")
-                        return ce['lastPrice'], atm, "CE", True
-    except Exception as e:
-        print(f"Proxy NSE fail {e}")
-
-    # ===== METHOD 3: Last resort - Don't give fake 254 =====
-    return None, atm, "CE", False
-
-def get_spot_yahoo(symbol):
+                    if ce and ce.get('lastPrice',0) > 2:
+                        return float(ce['lastPrice']), atm, "CE"
+    except: pass
     try:
-        m = {"NIFTY":"^NSEI","BANKNIFTY":"^NSEBANK","SENSEX":"^BSESN"}
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{m.get(symbol,'^NSEI')}?interval=1m&range=1d"
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10).json()
-        return float(r['chart']['result'][0]['meta']['regularMarketPrice'])
-    except:
-        return None
+        url = f"https://api.allorigins.win/get?url={encoded}"
+        r = requests.get(url, timeout=15).json()
+        data = json.loads(r.get('contents','{}'))
+        for row in data.get('records',{}).get('data',[]):
+            if row.get('strikePrice') == atm:
+                ce = row.get('CE')
+                if ce and ce.get('lastPrice',0) > 2:
+                    return float(ce['lastPrice']), atm, "CE"
+    except: pass
+    return None, atm, "CE"
 
-def format_msg(sym, strike, price, spot, typ, is_real):
-    if not is_real or not price:
-        return f"⚠️ *{sym} {strike} {typ}*\n\n📍 SPOT: {spot}\n\nGroww API ippudu kooda fetch avvatledu mowa.\nNee Groww app lo {sym} {strike} CE price ento cheppu, nenu check chesta.\n\nProxy try chestunna, 1 min lo malli nokku."
-
-    sl = int(price * 0.75)
-    t1 = int(price * 1.10); t2 = int(price * 1.20); t3 = int(price * 1.30)
-    return f"🔥 *{sym} {strike} {typ}*\n\n💰 ENTRY: {price}\n🛑 SL: {sl} (-25%)\n🎯 T1: {t1} (+10%)\n🎯 T2: {t2} (+20%)\n🎯 T3: {t3} (+30%)\n\n📍 SPOT: {spot}\n📦 ✅ GROWW REAL\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+def format_msg(sym, strike, price, spot, typ):
+    if not price:
+        return f"🔥 *{sym} {strike} {typ}*\n📍 SPOT: {spot}\n\n⏳ Fetching... try again in 10 sec"
+    sl = int(price * 0.75); t1 = int(price * 1.10); t2 = int(price * 1.20); t3 = int(price * 1.30)
+    return f"🔥 *{sym} {strike} {typ}*\n\n💰 ENTRY: {price}\n🛑 SL: {sl}\n🎯 T1: {t1}\n🎯 T2: {t2}\n🎯 T3: {t3}\n\n📍 SPOT: {spot}\n⏰ {datetime.now().strftime('%H:%M:%S')}"
 
 def bot_loop():
     time.sleep(10)
-    send_tg("✅ *GROWW REAL MODE ON*\n\nIppudu Groww app lo unna 816.40 ne ENTRY vastadi, fake 254 raadu!")
+    send_tg("✅ *BOT LIVE*")
     send_menu()
     while True:
         try:
             for sym in ["NIFTY","BANKNIFTY"]:
-                spot = get_spot_yahoo(sym)
+                spot = get_spot(sym)
                 if not spot: continue
-                price, strike, typ, is_real = get_spot_and_real_option(sym, spot)
-                if price:
-                    send_tg(format_msg(sym, strike, price, spot, typ, is_real))
-            time.sleep(120)
-        except Exception as e:
-            print(f"Loop {e}"); time.sleep(60)
+                price, strike, typ = get_real(sym, spot)
+                if price: send_tg(format_msg(sym, strike, price, spot, typ))
+            time.sleep(180)
+        except: time.sleep(60)
 
 def tg_polling():
     offset=0
@@ -118,20 +90,19 @@ def tg_polling():
                 cq=upd.get("callback_query")
                 if cq:
                     data=cq.get("data")
-                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id":cq["id"],"text":f"{data} fetching..."})
+                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id":cq["id"],"text":f"{data}"})
                     if data=="TEST":
-                        n=get_spot_yahoo("NIFTY"); b=get_spot_yahoo("BANKNIFTY")
-                        send_tg(f"🧪 *GROWW REAL TEST*\n\nNIFTY {n} -> ATM {round(n/50)*50}\nBANKNIFTY {b} -> ATM {round(b/100)*100}\n\nIppudu real price vastadi!")
+                        n=get_spot("NIFTY"); b=get_spot("BANKNIFTY")
+                        send_tg(f"📊 NIFTY {n} | ATM {round(n/50)*50}\n📊 BANKNIFTY {b} | ATM {round(b/100)*100}")
                     elif data in ["NIFTY","BANKNIFTY","SENSEX"]:
-                        spot=get_spot_yahoo(data)
-                        price,strike,typ,is_real=get_spot_and_real_option(data,spot)
-                        send_tg(format_msg(data,strike,price,spot,typ,is_real))
+                        spot=get_spot(data)
+                        price,strike,typ=get_real(data,spot)
+                        send_tg(format_msg(data,strike,price,spot,typ))
                     send_menu()
             time.sleep(2)
         except: time.sleep(5)
 
 threading.Thread(target=bot_loop, daemon=True).start()
 threading.Thread(target=tg_polling, daemon=True).start()
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
