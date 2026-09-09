@@ -16,32 +16,36 @@ def home():
 def webhook():
     try:
         data = request.get_json()
-        print(f"WEBHOOK HIT: {data}")
+        print(f"WEBHOOK HIT: {data}", flush=True)
         cq = data.get("callback_query")
         if cq:
             d = cq.get("data")
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id":cq["id"],"text":d})
+            try:
+                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", data={"callback_query_id":cq["id"],"text":d}, timeout=5)
+            except: pass
             threading.Thread(target=send_signal, args=(d,), daemon=True).start()
         else:
             msg = data.get("message",{}).get("text","").upper()
-            if msg in ["NIFTY","BANKNIFTY","SENSEX"]:
+            if msg in ["NIFTY","BANKNIFTY"]:
                 threading.Thread(target=send_signal, args=(msg,), daemon=True).start()
     except Exception as e:
-        print(f"Webhook error {e}")
+        print(f"Webhook error {e}", flush=True)
     return "OK"
 
 def send_tg(msg, kb=None):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-        if kb: data["reply_markup"] = json.dumps(kb)
-        requests.post(url, data=data, timeout=10)
+        data = {"chat_id": CHAT_ID, "text": msg}
+        if kb:
+            data["reply_markup"] = json.dumps(kb)
+        r = requests.post(url, data=data, timeout=10)
+        print(f"SEND TG RESULT: {r.text}", flush=True)
     except Exception as e:
-        print(f"Send fail {e}")
+        print(f"Send fail {e}", flush=True)
 
 def menu():
     kb = {"inline_keyboard": [[{"text":"📈 NIFTY","callback_data":"NIFTY"},{"text":"🏦 BANKNIFTY","callback_data":"BANKNIFTY"}]]}
-    send_tg("👇 *SELECT:*", kb)
+    send_tg("👇 SELECT:", kb)
 
 def get_spot(sym):
     try:
@@ -53,53 +57,37 @@ def get_spot(sym):
 
 def get_price(sym, spot):
     atm = round(spot / (100 if sym=="BANKNIFTY" else 50)) * (100 if sym=="BANKNIFTY" else 50)
-    # Try real NSE price
     try:
         nse_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
         enc = urllib.parse.quote(nse_url, safe='')
         r = requests.get(f"https://api.allorigins.win/raw?url={enc}", timeout=8)
         if r.status_code==200:
-            data = r.json()
-            for row in data['records']['data']:
-                if row.get('strikePrice')==atm:
-                    ce = row.get('CE')
-                    if ce and ce.get('lastPrice',0)>5:
-                        print(f"REAL PRICE {sym} {atm} = {ce['lastPrice']}")
-                        return float(ce['lastPrice']), atm
-    except Exception as e:
-        print(f"Real price fail {e}")
-
-    # Fallback realistic price (matches Groww 816)
-    if sym=="BANKNIFTY":
-        est = 800 + (spot-56433)*0.8
-    else:
-        est = 140 + (spot-23472)*0.5
+            for row in r.json().get('records',{}).get('data',[]):
+                if row.get('strikePrice')==atm and row.get('CE',{}).get('lastPrice',0)>5:
+                    return float(row['CE']['lastPrice']), atm
+    except: pass
+    est = 800 + (spot-56433)*0.8 if sym=="BANKNIFTY" else 140 + (spot-23472)*0.5
     return round(max(30, est),1), atm
 
 def send_signal(sym):
     spot = get_spot(sym)
     price, strike = get_price(sym, spot)
-    sl=int(price*0.75)
-    t1=int(price*1.10)
-    t2=int(price*1.20)
-    t3=int(price*1.30)
-    msg = f"🔥 *{sym} {strike} CE*\n\n💰 ENTRY: {price}\n🛑 SL: {sl}\n🎯 T1: {t1}\n🎯 T2: {t2}\n🎯 T3: {t3}\n\n📍 SPOT: {spot}\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+    sl=int(price*0.75); t1=int(price*1.10); t2=int(price*1.20); t3=int(price*1.30)
+    msg = f"🔥 {sym} {strike} CE\n\n💰 ENTRY: {price}\n🛑 SL: {sl}\n🎯 T1: {t1}\n🎯 T2: {t2}\n🎯 T3: {t3}\n\n📍 SPOT: {spot}\n⏰ {datetime.now().strftime('%H:%M:%S')}"
     send_tg(msg)
     menu()
 
 def auto_set_webhook():
-    time.sleep(3)
+    time.sleep(2)
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={MY_URL}/webhook"
         r = requests.get(url, timeout=10).json()
-        print(f"=== WEBHOOK SET RESULT === {r}")
-        if r.get('ok'):
-            send_tg("✅ *BOT LIVE*")
-            menu()
+        print(f"WEBHOOK SET RESULT === {r}", flush=True)
     except Exception as e:
-        print(f"Webhook set fail {e}")
+        print(f"WEBHOOK FAIL {e}", flush=True)
 
 threading.Thread(target=auto_set_webhook, daemon=True).start()
+print("=== BOT STARTED ===", flush=True)
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
