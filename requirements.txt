@@ -1,4 +1,4 @@
 Flask
 requests
-yfinance
 cloudscraper
+gunicorn
