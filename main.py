@@ -1,122 +1,219 @@
-import os, threading, requests, time, datetime
+import os
+import requests
+import threading
+import time
 from flask import Flask, request
+from datetime import datetime
 
 app = Flask(__name__)
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID", "")
-MY_URL = os.environ.get("MY_URL", "")
-DHAN_CLIENT_ID = os.environ.get("DHAN_CLIENT_ID")
-DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN")
 
-def send_tg(msg, chat_id=None):
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
+DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
+MY_URL = os.getenv("MY_URL")
+
+# Dhan headers
+def dhan_headers():
+    return {
+        "access-token": DHAN_ACCESS_TOKEN,
+        "client-id": DHAN_CLIENT_ID,
+        "Content-Type": "application/json"
+    }
+
+# 1. Get Expiry List - CORRECT V2 URL
+def get_dhan_expiry(underlying_scrip, underlying_seg):
     try:
-        cid = str(chat_id or CHAT_ID)
-        if not cid: return
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      data={"chat_id": cid, "text": msg, "parse_mode": "Markdown"}, timeout=15)
-    except Exception as e: print(e)
-
-def is_market_open():
-    now = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
-    if now.weekday()>=5: return False
-    return (9,15) <= (now.hour, now.minute) <= (15,35)
-
-def get_live_data(sym):
-    spot=0; prev=0; atm=0
-    # 1. Spot from Yahoo
-    try:
-        y_map = {"NIFTY":"%5ENSEI","BANKNIFTY":"%5ENSEBANK","SENSEX":"%5EBSESN"}
-        yr = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{y_map.get(sym,'%5ENSEI')}", headers={"User-Agent":"Mozilla/5.0"}, timeout=10).json()
-        meta = yr['chart']['result'][0]['meta']
-        spot=float(meta['regularMarketPrice']); prev=float(meta['previousClose'])
-        gap=50 if sym=="NIFTY" else 100 if sym=="BANKNIFTY" else 100
-        atm=int(round(spot/gap)*gap)
-    except: return 0,0,0,None,None,None
-
-    # 2. DHAN REAL NSE LTP - Exact 155.65
-    try:
-        headers = {"access-token": DHAN_ACCESS_TOKEN, "client-id": DHAN_CLIENT_ID}
-        scrip_map = {"NIFTY":13, "BANKNIFTY":25, "SENSEX":51}
-        scrip = scrip_map.get(sym,13)
-
-        # get expiry
-        exp_r = requests.get(f"https://api.dhan.co/v2/optionchain/expirylist",
-                             headers=headers,
-                             params={"UnderlyingScrip": scrip, "UnderlyingSeg": "IDX_I"}, timeout=10)
-        print(f"Dhan expiry {sym}: {exp_r.text[:200]}")
-        exps = exp_r.json().get('data', [])
-        if exps:
-            expiry = exps[0]
-            chain_r = requests.get("https://api.dhan.co/v2/optionchain",
-                                   headers=headers,
-                                   params={"UnderlyingScrip": scrip, "UnderlyingSeg": "IDX_I", "Expiry": expiry}, timeout=15)
-            oc = chain_r.json().get('data',{}).get('oc',{})
-            for strike_str, vals in oc.items():
-                if int(float(strike_str))==atm:
-                    ce_price = float(vals.get('ce',{}).get('last_price',0))
-                    pe_price = float(vals.get('pe',{}).get('last_price',0))
-                    if ce_price>0:
-                        print(f"DHAN REAL {sym} {atm} CE {ce_price} PE {pe_price}")
-                        return spot, prev, atm, {"lastPrice": ce_price}, {"lastPrice": pe_price}, f"DHAN REAL LIVE {expiry}"
+        url = "https://api.dhan.co/v2/optionchain/expirylist"
+        payload = {
+            "UnderlyingScrip": underlying_scrip,
+            "UnderlyingSeg": underlying_seg
+        }
+        r = requests.post(url, headers=dhan_headers(), json=payload, timeout=15)
+        print(f"Dhan expiry response {underlying_scrip}: {r.status_code} {r.text[:500]}")
+        if r.status_code == 200:
+            j = r.json()
+            if 'data' in j and len(j['data']) > 0:
+                return j['data'][0] # e.g. "2026-09-12"
+        return None
     except Exception as e:
-        print(f"Dhan error {e}")
+        print(f"Expiry error: {e}")
+        return None
 
-    # 3. Fallback NSE Official
+# 2. Get Index Spot LTP (NIFTY/BANKNIFTY/SENSEX)
+def get_index_ltp(underlying_scrip, underlying_seg):
     try:
-        sess = requests.Session()
-        sess.headers.update({"User-Agent":"Mozilla/5.0"})
-        sess.get("https://www.nseindia.com", timeout=5)
-        nse_r = sess.get(f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}", timeout=10)
-        data = nse_r.json()
-        for item in data['records']['data']:
-            if item.get('strikePrice')==atm and item.get('expiryDate')==data['records']['expiryDates'][0]:
-                ce=item.get('CE',{}); pe=item.get('PE',{})
-                if ce.get('lastPrice',0)>0:
-                    return spot, prev, atm, {"lastPrice": ce['lastPrice']}, {"lastPrice": pe['lastPrice']}, "NSE OFFICIAL LIVE"
-    except: pass
+        url = "https://api.dhan.co/v2/marketfeed/ltp"
+        # For Index, exchange is IDX_I
+        seg_key = "IDX_I" if underlying_seg == "IDX_I" else "NSE_FNO"
+        # Dhan needs Security ID for index: 13=NIFTY, 25=BANKNIFTY, 51=SENSEX
+        payload = { seg_key: [underlying_scrip] } if seg_key == "IDX_I" else {"IDX_I": [underlying_scrip]}
+        # Correct format for IDX_I is IDX_I
+        payload = {"IDX_I": [underlying_scrip]}
+        r = requests.post(url, headers=dhan_headers(), json=payload, timeout=10)
+        print(f"Index LTP {underlying_scrip}: {r.text[:500]}")
+        if r.status_code == 200:
+            j = r.json()
+            # response structure: data -> IDX_I -> {id: {last_price}}
+            data = j.get('data', {})
+            idx_data = data.get('IDX_I', {})
+            if str(underlying_scrip) in idx_data:
+                return idx_data[str(underlying_scrip)]['last_price']
+            # sometimes key is int
+            for k,v in idx_data.items():
+                return v['last_price']
+        return None
+    except Exception as e:
+        print(f"Index LTP error: {e}")
+        return None
 
-    return 0,0,0,None,None,None
+# 3. Get Option LTP by strike
+def get_option_ltp(underlying_scrip, underlying_seg, expiry, strike, opt_type):
+    try:
+        # Get option chain
+        url = "https://api.dhan.co/v2/optionchain"
+        payload = {
+            "UnderlyingScrip": underlying_scrip,
+            "UnderlyingSeg": underlying_seg,
+            "Expiry": expiry
+        }
+        r = requests.post(url, headers=dhan_headers(), json=payload, timeout=15)
+        if r.status_code!= 200:
+            print(f"Option chain failed: {r.text[:1000]}")
+            return None
 
-def send_smart_signals(sym, chat_id=None, auto=False):
-    spot,prev,atm,ce,pe,source = get_live_data(sym)
-    if not ce:
-        if not auto: send_tg(f"⏳ *{sym} connecting Dhan...* Try again 30 sec /{sym.lower()}", chat_id)
-        return False
-    change=((spot-prev)/prev*100) if prev else 0
-    trend="BULLISH 🚀" if change>0.6 else "BEARISH 🔻" if change<-0.6 else "SIDEWAYS ↔️"
-    tag="🤖 AUTO" if auto else "📊"
-    msg = f"{tag} *{sym} {atm} | {int(spot)} ({change:+.2f}%) ✅ {source}*\nTrend: {trend}\n\n🟢 {atm} CE: {ce['lastPrice']}\n🔴 {atm} PE: {pe['lastPrice']}\n\n_Strict SL | Target 1:2_"
-    send_tg(msg, chat_id)
-    return True
+        j = r.json()
+        oc_list = j.get('data', {}).get('oc', {})
 
+        # oc is dict: strike -> {ce, pe}
+        # Dhan format: {"25000": {"ce": {securityId...}, "pe": {...}}}
+        target_sec_id = None
+        # Try dict format
+        if isinstance(oc_list, dict):
+            s_key = str(float(strike)) if f"{strike}.0" in oc_list else str(strike)
+            # find closest
+            for k, v in oc_list.items():
+                try:
+                    if int(float(k)) == int(strike):
+                        if opt_type == "CE" and 'ce' in v:
+                            target_sec_id = v['ce'].get('securityId')
+                        elif opt_type == "PE" and 'pe' in v:
+                            target_sec_id = v['pe'].get('securityId')
+                        break
+                except:
+                    continue
+        elif isinstance(oc_list, list): # old format
+            for item in oc_list:
+                if int(float(item.get('strikePrice',0))) == int(strike) and item.get('optionType') == opt_type:
+                    target_sec_id = item.get('securityId')
+                    break
+
+        if not target_sec_id:
+            print(f"Strike {strike} {opt_type} not found")
+            return None
+
+        # Get LTP for that security
+        ltp_url = "https://api.dhan.co/v2/marketfeed/ltp"
+        ltp_payload = {"NSE_FNO": [int(target_sec_id)]}
+        ltp_r = requests.post(ltp_url, headers=dhan_headers(), json=ltp_payload, timeout=10)
+        ltp_j = ltp_r.json()
+        ltp = ltp_j['data']['NSE_FNO'][str(target_sec_id)]['last_price']
+        return ltp
+
+    except Exception as e:
+        print(f"Option LTP error {strike}{opt_type}: {e}")
+        return None
+
+def send_telegram(text, chat_id=None):
+    try:
+        cid = chat_id or CHAT_ID
+        if not cid:
+            return
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": cid, "text": text, "parse_mode": "Markdown"}, timeout=10)
+    except Exception as e:
+        print(f"Telegram send error: {e}")
+
+def build_msg(index_name, scrip, seg):
+    expiry = get_dhan_expiry(scrip, seg)
+    if not expiry:
+        return f"⏳ {index_name} expiry syncing - try again 1 min /{index_name.lower()}"
+
+    spot = get_index_ltp(scrip, seg) or 0
+    atm = round(spot / 50) * 50 if index_name!= "SENSEX" else round(spot / 100) * 100
+
+    # Get ATM CE PE
+    ce_ltp = get_option_ltp(scrip, seg, expiry, atm, "CE")
+    pe_ltp = get_option_ltp(scrip, seg, expiry, atm, "PE")
+
+    if ce_ltp is None:
+        return f"⏳ {index_name} connecting Dhan... Try again 30 sec /{index_name.lower()}"
+
+    ce_str = f"{ce_ltp:.2f}"
+    pe_str = f"{pe_ltp:.2f}" if pe_ltp else "N/A"
+
+    msg = f"📊 *{index_name} {expiry}*\n"
+    msg += f"Spot: {spot:.2f} | ATM: {atm}\n\n"
+    msg += f"🟢 CE {atm}: {ce_str}\n"
+    msg += f"🔴 PE {atm}: {pe_str}\n\n"
+    msg += f"✅ DHAN REAL LIVE"
+    return msg
+
+@app.route("/")
+def home():
+    return "Bot Live - Dhan V2"
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    try:
+        data = request.get_json()
+        if not data:
+            return "ok"
+        message = data.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        text = message.get("text", "").lower()
+
+        if not text:
+            return "ok"
+
+        # Save chat_id automatically
+        global CHAT_ID
+        if chat_id:
+            os.environ["CHAT_ID"] = str(chat_id)
+
+        if "/nifty" in text:
+            msg = build_msg("NIFTY", 13, "IDX_I")
+            send_telegram(msg, chat_id)
+        elif "/banknifty" in text:
+            msg = build_msg("BANKNIFTY", 25, "IDX_I")
+            send_telegram(msg, chat_id)
+        elif "/sensex" in text:
+            msg = build_msg("SENSEX", 51, "IDX_I")
+            send_telegram(msg, chat_id)
+        elif "/start" in text:
+            send_telegram("Welcome! Use /nifty /banknifty /sensex", chat_id)
+
+        return "ok"
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return "ok"
+
+# Auto loop for 10 min signals
 def auto_loop():
     while True:
         try:
-            if is_market_open() and CHAT_ID:
-                for s in ["NIFTY","BANKNIFTY","SENSEX"]:
-                    send_smart_signals(s, CHAT_ID, auto=True)
-                    time.sleep(5)
-                time.sleep(600) # 10 min
-            else: time.sleep(60)
+            now = datetime.now()
+            # Market hours 9:15 to 15:30 IST Mon-Fri
+            if now.weekday() < 5 and 9 <= now.hour < 16:
+                if CHAT_ID:
+                    msg = build_msg("NIFTY", 13, "IDX_I")
+                    send_telegram(f"🔔 Auto 10min\n{msg}")
+            time.sleep(600) # 10 min
         except Exception as e:
-            print(e); time.sleep(60)
-
-@app.route('/')
-def home(): return "Dhan Bot Live"
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    data=request.get_json()
-    if not data: return "ok"
-    chat_id=data.get('message',{}).get('chat',{}).get('id')
-    text=data.get('message',{}).get('text','').lower()
-    if not chat_id: return "ok"
-    os.environ["CHAT_ID"]=str(chat_id)
-    if 'sensex' in text: threading.Thread(target=send_smart_signals, args=("SENSEX",chat_id)).start()
-    elif 'bank' in text: threading.Thread(target=send_smart_signals, args=("BANKNIFTY",chat_id)).start()
-    else: threading.Thread(target=send_smart_signals, args=("NIFTY",chat_id)).start()
-    return "ok"
+            print(f"Auto loop error: {e}")
+            time.sleep(60)
 
 threading.Thread(target=auto_loop, daemon=True).start()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
+    app.run(host="0.0.0.0", port=10000)
