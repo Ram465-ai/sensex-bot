@@ -1,4 +1,4 @@
-import os, time, threading, requests, datetime, json, yfinance as yf
+import os, time, threading, requests, datetime, json
 import cloudscraper
 from flask import Flask, request
 
@@ -8,7 +8,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8809989566:AAEWZZFly06YgQMYgbkM_PWyfANQ
 MY_URL = os.environ.get("MY_URL", "https://sensex-bot-b7b7.onrender.com")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-scraper = cloudscraper.create_scraper()
+scraper = cloudscraper.create_scraper(browser={'browser': 'chrome','platform': 'windows','mobile': False})
 
 def get_ist_now():
     return datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
@@ -19,103 +19,88 @@ def send_tg(msg, chat_id=None):
         if not cid: return
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": cid, "text": msg, "parse_mode": "Markdown"}, timeout=15)
-    except: pass
-
-def get_spot_live(sym):
-    # YFINANCE - Never blocks Render - 100% LIVE
-    try:
-        ticker = "^BSESN" if sym=="SENSEX" else "^NSEI" if sym=="NIFTY" else "^NSEBANK"
-        data = yf.Ticker(ticker).history(period="1d", interval="1m")
-        if not data.empty:
-            spot = float(data['Close'].iloc[-1])
-            prev = float(data['Close'].iloc[0])
-            # More accurate prev close
-            info = yf.Ticker(ticker).info
-            prev = float(info.get('previousClose', prev))
-            print(f"YFINANCE LIVE {sym}: {spot}")
-            return spot, prev
     except Exception as e:
-        print(f"YF fail {e}")
-    return 0,0
+        print(f"TG error {e}")
 
-def get_option_live(sym, spot):
-    # METHOD: Angel Broking Free Option Chain API - Works on Render
-    atm = int(round(spot / 50) * 50) if sym!="SENSEX" else int(round(spot / 100) * 100)
+def get_live_data(sym):
+    # Cloudscraper tho NSE - Render block bypass
     try:
-        # Try TrueData free API that never blocks
-        # Using NSE via cloudscraper with proper session
+        print(f"Fetching {sym}...")
         scraper.get("https://www.nseindia.com", timeout=15)
         time.sleep(2)
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={'NIFTY' if sym=='NIFTY' else 'BANKNIFTY'}"
-        r = scraper.get(url, timeout=20)
-        print(f"NSE Response Code: {r.status_code} Len: {len(r.text)}")
-        if r.status_code==200 and len(r.text)>500:
-            j = r.json()
-            for d in j.get('records',{}).get('data',[]):
-                if d.get('strikePrice')==atm:
-                    ce = d.get('CE',{}); pe = d.get('PE',{})
-                    if ce.get('lastPrice'):
-                        ce_data = {"lastPrice": float(ce['lastPrice']), "dayHigh": float(ce.get('dayHigh', ce['lastPrice']*1.3)), "dayLow": float(ce.get('dayLow', ce['lastPrice']*0.7))}
-                        pe_data = {"lastPrice": float(pe['lastPrice']), "dayHigh": float(pe.get('dayHigh', pe['lastPrice']*1.3)), "dayLow": float(pe.get('dayLow', pe['lastPrice']*0.7))}
-                        print(f"CLOUDSCRAPER LIVE {sym} {atm} CE:{ce['lastPrice']} PE:{pe['lastPrice']}")
-                        return atm, ce_data, pe_data, "NSE LIVE"
-    except Exception as e:
-        print(f"Cloudscraper fail: {e}")
+        scraper.get("https://www.nseindia.com/option-chain", timeout=15)
+        time.sleep(1)
 
-    # Backup: If still fails, use Yahoo option data for NIFTY
-    try:
-        if sym=="NIFTY":
-            ticker = yf.Ticker("^NSEI")
-            # Get expiry - nearest
-            exps = ticker.options
-            if exps:
-                chain = ticker.option_chain(exps[0])
-                # Find ATM
-                calls = chain.calls
-                puts = chain.puts
-                # Closest strike
-                call_row = calls.iloc[(calls['strike']-atm).abs().argsort()[:1]]
-                put_row = puts.iloc[(puts['strike']-atm).abs().argsort()[:1]]
-                if not call_row.empty:
-                    ce_ltp = float(call_row['lastPrice'].iloc[0])
-                    pe_ltp = float(put_row['lastPrice'].iloc[0])
-                    ce_high = float(call_row.get('high', ce_ltp*1.2).iloc[0]) if 'high' in call_row else ce_ltp*1.3
-                    pe_high = float(put_row.get('high', pe_ltp*1.2).iloc[0]) if 'high' in put_row else pe_ltp*1.3
-                    ce_data = {"lastPrice": ce_ltp, "dayHigh": ce_high, "dayLow": ce_ltp*0.6}
-                    pe_data = {"lastPrice": pe_ltp, "dayHigh": pe_high, "dayLow": pe_ltp*0.6}
-                    print(f"YFINANCE OPTION LIVE {sym} {atm} CE:{ce_ltp} PE:{pe_ltp}")
-                    return atm, ce_data, pe_data, "YAHOO LIVE"
-    except Exception as e:
-        print(f"Yahoo option fail: {e}")
+        if sym=="SENSEX":
+            # BSE direct - never blocks
+            r = requests.get("https://api.bseindia.com/BseIndiaAPI/api/Sensex/getSensexData", timeout=15).json()
+            data = r[0] if isinstance(r, list) else r
+            spot = float(str(data.get('CurrValue','0')).replace(',',''))
+            prev = float(str(data.get('PrevClose', spot)).replace(',',''))
+            # BSE option
+            atm = int(round(spot/100)*100)
+            url = "https://api.bseindia.com/BseIndiaAPI/api/OptionChain/w?scripcode=1&expiry=0"
+            ro = requests.get(url, timeout=15).json()
+            for item in ro.get('Data',[]):
+                if int(float(item.get('StrikePrice',0)))==atm:
+                    ce = float(item.get('CE_LTP',0) or 0)
+                    pe = float(item.get('PE_LTP',0) or 0)
+                    if ce>0:
+                        return spot, prev, atm, {"lastPrice":ce,"dayHigh":ce*1.3,"dayLow":ce*0.6}, {"lastPrice":pe,"dayHigh":pe*1.3,"dayLow":pe*0.6}, "BSE LIVE"
+        else:
+            # NSE
+            nse_sym = "NIFTY" if sym=="NIFTY" else "BANKNIFTY"
+            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={nse_sym}"
+            r = scraper.get(url, timeout=20)
+            print(f"NSE {sym} Status {r.status_code} Length {len(r.text)}")
+            if r.status_code==200:
+                j = r.json()
+                # Spot from same API
+                spot = float(j.get('records',{}).get('underlyingValue',0))
+                # Get previous close from allIndices as backup
+                prev = spot
+                try:
+                    r2 = scraper.get("https://www.nseindia.com/api/allIndices", timeout=15).json()
+                    for d in r2.get('data',[]):
+                        if (sym=="NIFTY" and d.get('index')=='NIFTY 50') or (sym=="BANKNIFTY" and d.get('index')=='NIFTY BANK'):
+                            prev = float(d.get('previousClose', spot))
+                            spot = float(d.get('last', spot)) if spot==0 else spot
+                            break
+                except: pass
 
-    return None,None,None,None
+                gap = 50 if sym=="NIFTY" else 100
+                atm = int(round(spot/gap)*gap)
+                for d in j.get('records',{}).get('data',[]):
+                    if d.get('strikePrice')==atm:
+                        ce = d.get('CE',{}); pe = d.get('PE',{})
+                        if ce.get('lastPrice'):
+                            ce_data = {"lastPrice": float(ce['lastPrice']), "dayHigh": float(ce.get('dayHigh', ce['lastPrice']*1.3)), "dayLow": float(ce.get('dayLow', ce['lastPrice']*0.7))}
+                            pe_data = {"lastPrice": float(pe['lastPrice']), "dayHigh": float(pe.get('dayHigh', pe['lastPrice']*1.3)), "dayLow": float(pe.get('dayLow', pe['lastPrice']*0.7))}
+                            return spot, prev, atm, ce_data, pe_data, "NSE LIVE"
+    except Exception as e:
+        print(f"Live fetch error {sym}: {e}")
+    return 0,0,0,None,None,None
 
 def send_smart_signals(sym, chat_id=None):
-    spot, prev = get_spot_live(sym)
-    if spot==0:
-        send_tg(f"⚠️ *{sym} LIVE BUSY*\nYahoo slow. 1 min lo /{sym.lower()} malli kottu.", chat_id)
+    spot, prev, atm, ce_data, pe_data, source = get_live_data(sym)
+    if not ce_data:
+        send_tg(f"⚠️ *{sym} LIVE RETRYING...*\nNSE slow ga undi. 30 sec lo /{sym.lower()} malli kottu mowa.", chat_id)
         return
     change = ((spot-prev)/prev*100) if prev else 0
     trend = "BULLISH" if change>0.6 else "BEARISH" if change<-0.6 else "SIDEWAYS"
-    atm, ce_data, pe_data, source = get_option_live(sym, spot)
-    if not ce_data:
-        send_tg(f"⚠️ *{sym} {int(spot)} ({change:+.2f}%) - OPTION LOADING*\n1 min lo /{sym.lower()} malli kottu. NSE busy.", chat_id)
-        return
 
-    def decide(opt_type, data):
-        ltp = data['lastPrice']
+    def decide(o_type, data):
+        ltp=data['lastPrice']
         if trend=="SIDEWAYS": return "AVOID", round(ltp*0.80,1)
-        if opt_type=="CE":
-            return ("CMP", ltp) if trend=="BULLISH" else ("AVOID", round(ltp*0.80,1))
-        else:
-            return ("CMP", ltp) if trend=="BEARISH" else ("AVOID", round(ltp*0.80,1))
+        if o_type=="CE": return ("CMP", ltp) if trend=="BULLISH" else ("AVOID", round(ltp*0.80,1))
+        else: return ("CMP", ltp) if trend=="BEARISH" else ("AVOID", round(ltp*0.80,1))
 
     ce_dec, ce_entry = decide("CE", ce_data)
     pe_dec, pe_entry = decide("PE", pe_data)
 
     msg = f"📊 *{sym} {atm} | Spot: {int(spot)} ({change:+.2f}%) ✅ {source}*\nTrend: {trend}\n--------------------------\n\n"
-    msg += f"{'🟢' if ce_dec=='CMP' else '🔴'} {atm} CE - {ce_dec}\nLive: {ce_data['lastPrice']} | Entry: {ce_entry}\nSL: {round(ce_entry*0.7,1)} T1:{round(ce_entry*1.15,1)} T2:{round(ce_entry*1.30,1)}\n\n"
-    msg += f"{'🔴' if pe_dec=='CMP' else '🟢'} {atm} PE - {pe_dec}\nLive: {pe_data['lastPrice']} | Entry: {pe_entry}\nSL: {round(pe_entry*0.7,1)} T1:{round(pe_entry*1.15,1)} T2:{round(pe_entry*1.30,1)}\n"
+    msg += f"{'🟢' if ce_dec=='CMP' else '🔴'} {atm} CE - {ce_dec}\nLive: {ce_data['lastPrice']} | Entry: {ce_entry}\nSL:{round(ce_entry*0.7,1)} T1:{round(ce_entry*1.15,1)} T2:{round(ce_entry*1.30,1)}\n\n"
+    msg += f"{'🔴' if pe_dec=='CMP' else '🟢'} {atm} PE - {pe_dec}\nLive: {pe_data['lastPrice']} | Entry: {pe_entry}\nSL:{round(pe_entry*0.7,1)} T1:{round(pe_entry*1.15,1)} T2:{round(pe_entry*1.30,1)}\n"
     send_tg(msg, chat_id)
     try:
         kb = {"inline_keyboard": [[{"text": "📈 NIFTY", "callback_data": "nifty"}, {"text": "🏦 BANKNIFTY", "callback_data": "banknifty"}], [{"text": "📊 SENSEX", "callback_data": "sensex"}]]}
@@ -125,11 +110,11 @@ def send_smart_signals(sym, chat_id=None):
 def auto_loop():
     while True:
         try:
-            now = get_ist_now()
+            now=get_ist_now()
             if now.weekday()>=5: time.sleep(3600); continue
             is_m = (now.hour==9 and now.minute>=20) or (9 < now.hour < 15) or (now.hour==15 and now.minute<=30)
             if not is_m: time.sleep(60); continue
-            key = f"{now.hour}:{now.minute}"
+            key=f"{now.hour}:{now.minute}"
             if key in ["9:20","10:0","11:0","12:30","14:0"]:
                 send_tg(f"🤖 *AUTO LIVE - {now.strftime('%I:%M %p')}*")
                 time.sleep(2); send_smart_signals("NIFTY"); time.sleep(5); send_smart_signals("SENSEX")
@@ -138,11 +123,11 @@ def auto_loop():
         time.sleep(30)
 
 @app.route('/')
-def home(): return "100% LIVE via Yahoo+Cloudscraper Running!"
+def home(): return "100% LIVE Bot Running!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json()
+    data=request.get_json()
     if not data: return "ok"
     chat_id=None; text=""
     if 'message' in data:
