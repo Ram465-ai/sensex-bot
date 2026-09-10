@@ -1,204 +1,177 @@
-import os
-import requests
-import threading
-import time
+mport os, requests, threading, time
 from flask import Flask, request
 from datetime import datetime
 
 app = Flask(__name__)
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# NSE Session
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/option-chain"
-})
+# Free proxy API that works from USA server - bypasses NSE block
+def get_nse_data_proxy(symbol):
+    # Try 3 methods
+    urls = [
+        f"https://nseindia.vercel.app/api/option-chain-indices?symbol={symbol}",
+        f"https://nse-api-new.vercel.app/api/optionChain?symbol={symbol}",
+        f"https://api.niftytrader.in/api/option-chain?symbol={symbol}&expiry="
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
+            print(f"Trying {url} -> {r.status_code}")
+            if r.status_code == 200:
+                j = r.json()
+                # Normalize different formats
+                if 'records' in j: # NSE format
+                    return j
+                if 'data' in j and 'records' in j['data']:
+                    return j['data']
+                if 'body' in j: # vercel proxy
+                    return j['body'] if 'records' in j['body'] else j
+                return j
+        except Exception as e:
+            print(f"Proxy fail {url}: {e}")
+            continue
+    return None
 
-def get_nse_data(symbol):
+def get_spot_yahoo(symbol):
+    # Fallback - Yahoo Finance always works from USA
     try:
-        session.get("https://www.nseindia.com/option-chain", timeout=10)
-        time.sleep(0.5)
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        r = session.get(url, timeout=10)
-        if r.status_code == 200:
-            return r.json()
-        print(f"NSE {symbol} status {r.status_code}")
-        return None
+        ymap = {"NIFTY":"^NSEI", "BANKNIFTY":"^NSEBANK", "SENSEX":"^BSESN"}
+        ysym = ymap.get(symbol, "^NSEI")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}?interval=1m&range=1d"
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10).json()
+        price = r['chart']['result'][0]['meta']['regularMarketPrice']
+        return float(price)
     except Exception as e:
-        print(f"NSE error {symbol}: {e}")
+        print(f"Yahoo fail {e}")
         return None
 
 def build_msg(index_name):
     try:
-        # Symbol mapping
-        nse_symbol = "NIFTY" if index_name == "NIFTY" else "BANKNIFTY" if index_name == "BANKNIFTY" else "NIFTY"
+        symbol = "NIFTY" if index_name=="NIFTY" else "BANKNIFTY" if index_name=="BANKNIFTY" else "NIFTY"
 
-        if index_name == "SENSEX":
-            # SENSEX from BSE
-            try:
-                r = requests.get("https://api.bseindia.com/BseIndiaAPI/api/ComHeader/w?quotetype=EQ&scripcode=16", headers={"User-Agent":"Mozilla/5.0"}, timeout=10).json()
-                spot = float(r.get('CurrRate', 0))
-                atm = round(spot/100)*100
-                # For SENSEX we can't get option chain free, give spot only + NIFTY signal
-                msg = f"📊 *SENSEX Spot*\nSpot: {spot:.2f} | ATM: {atm}\n\n"
-                msg += f"For SENSEX Options, use Dhan Data API (₹499).\n"
-                msg += f"Free bot gives NIFTY/BANKNIFTY signals.\nUse /nifty /banknifty\n"
-                return msg
-            except:
-                return "⏳ SENSEX BSE syncing... try /nifty"
+        data = get_nse_data_proxy(symbol)
+        spot = None
 
-        data = get_nse_data(nse_symbol)
-        if not data or 'records' not in data:
-            return f"⏳ {index_name} NSE syncing... try again 10 sec /{index_name.lower()}"
+        if data and 'records' in data:
+            spot = data['records']['underlyingValue']
+            expiry = data['records']['expiryDates'][0]
+            atm = round(spot/50)*50
+            if symbol=="BANKNIFTY": atm = round(spot/100)*100
 
-        spot = data['records']['underlyingValue']
-        expiry = data['records']['expiryDates'][0]
-        atm = round(spot / 50) * 50
-        if index_name == "BANKNIFTY":
-            atm = round(spot / 100) * 100
+            ce_ltp = pe_ltp = ce_oi = pe_oi = 0
+            for item in data['records']['data']:
+                if item.get('strikePrice')==atm and item.get('expiryDate')==expiry:
+                    if 'CE' in item:
+                        ce_ltp = item['CE']['lastPrice']
+                        ce_oi = item['CE']['openInterest']
+                        ce_high = item['CE'].get('dayHigh', ce_ltp)
+                    if 'PE' in item:
+                        pe_ltp = item['PE']['lastPrice']
+                        pe_oi = item['PE']['openInterest']
+                        pe_high = item['PE'].get('dayHigh', pe_ltp)
+                    break
 
-        ce_data = None
-        pe_data = None
+            if ce_ltp==0:
+                raise Exception("CE 0")
 
-        # Find ATM data
-        for item in data['records']['data']:
-            if item.get('strikePrice') == atm and item.get('expiryDate') == expiry:
-                ce_data = item.get('CE')
-                pe_data = item.get('PE')
-                break
+            pcr = round(pe_oi/ce_oi,2) if ce_oi>0 else 1.0
 
-        if not ce_data and not pe_data:
-            return f"⏳ {index_name} ATM {atm} not found..."
+            if pcr>1.1:
+                entry = round(ce_high+2,1) if 'ce_high' in locals() else round(ce_ltp*1.03,1)
+                sl = round(entry*0.65,1)
+                t1 = round(entry*1.4,1)
+                t2 = round(entry*1.9,1)
+                signal = f"🟢 *BUY {atm} CE*\nEntry: > {entry}\nSL: {sl}\nT1: {t1} T2: {t2}\nReason: PCR {pcr} Bullish"
+            elif pcr<0.9:
+                entry = round(pe_high+2,1) if 'pe_high' in locals() else round(pe_ltp*1.03,1)
+                sl = round(entry*0.65,1)
+                t1 = round(entry*1.4,1)
+                t2 = round(entry*1.9,1)
+                signal = f"🔴 *BUY {atm} PE*\nEntry: > {entry}\nSL: {sl}\nT1: {t1} T2: {t2}\nReason: PCR {pcr} Bearish"
+            else:
+                signal = f"⚪ *WAIT*\nCE Buy > {round(ce_ltp*1.04,1)} | PE Buy > {round(pe_ltp*1.04,1)}\nPCR {pcr} Neutral"
 
-        ce_ltp = ce_data['lastPrice'] if ce_data else 0
-        pe_ltp = pe_data['lastPrice'] if pe_data else 0
-        ce_oi = ce_data['openInterest'] if ce_data else 0
-        pe_oi = pe_data['openInterest'] if pe_data else 0
-        ce_high = ce_data.get('dayHigh', ce_ltp) if ce_data else ce_ltp
-        pe_high = pe_data.get('dayHigh', pe_ltp) if pe_data else pe_ltp
-
-        # === ENTRY LOGIC - SMART BUY SIGNAL ===
-        # 1. OI Logic
-        oi_bias = "BULLISH" if pe_oi > ce_oi else "BEARISH"
-        pcr = round(pe_oi / ce_oi, 2) if ce_oi > 0 else 0
-
-        signal_text = ""
-        if pcr > 1.1: # More PE OI = Support = Bullish -> Buy CE
-            entry = round(ce_high + 1, 1) if ce_high > ce_ltp else round(ce_ltp * 1.03, 1)
-            sl = round(entry * 0.65, 1) # 35% SL
-            t1 = round(entry * 1.4, 1)
-            t2 = round(entry * 2.0, 1)
-            signal_text = (
-                f"🟢 *BUY {atm} CE*\n"
-                f"Entry: Above {entry}\n"
-                f"SL: {sl} (-35%)\n"
-                f"T1: {t1} | T2: {t2}\n"
-                f"Logic: PCR {pcr} Bullish + PE OI High\n"
-            )
-        elif pcr < 0.9: # More CE OI = Resistance = Bearish -> Buy PE
-            entry = round(pe_high + 1, 1) if pe_high > pe_ltp else round(pe_ltp * 1.03, 1)
-            sl = round(entry * 0.65, 1)
-            t1 = round(entry * 1.4, 1)
-            t2 = round(entry * 2.0, 1)
-            signal_text = (
-                f"🔴 *BUY {atm} PE*\n"
-                f"Entry: Above {entry}\n"
-                f"SL: {sl} (-35%)\n"
-                f"T1: {t1} | T2: {t2}\n"
-                f"Logic: PCR {pcr} Bearish + CE OI High\n"
-            )
+            msg = f"📊 *{index_name} {expiry}*\nSpot: {spot:.2f} ATM: {atm} PCR:{pcr}\nCE:{ce_ltp} OI:{ce_oi/1000:.0f}k | PE:{pe_ltp} OI:{pe_oi/1000:.0f}k\n\n{signal}\n\n✅ LIVE via Proxy"
+            return msg
         else:
-            # Sideways - give both
-            ce_entry = round(ce_ltp * 1.04, 1)
-            pe_entry = round(pe_ltp * 1.04, 1)
-            signal_text = (
-                f"⚪ *SIDEWAYS - Wait for Breakout*\n"
-                f"Buy CE above {ce_entry} | SL {round(ce_entry*0.65,1)}\n"
-                f"Buy PE above {pe_entry} | SL {round(pe_entry*0.65,1)}\n"
-                f"Logic: PCR {pcr} Neutral\n"
-            )
-
-        msg = f"📊 *{index_name} {expiry}*\n"
-        msg += f"Spot: {spot:.2f} | ATM: {atm} | PCR: {pcr}\n"
-        msg += f"CE LTP: {ce_ltp} | OI: {ce_oi/1000:.1f}k\n"
-        msg += f"PE LTP: {pe_ltp} | OI: {pe_oi/1000:.1f}k\n\n"
-        msg += signal_text + "\n"
-        msg += f"✅ NSE LIVE - Free, No Dhan needed"
-
-        return msg
+            # If proxy also fails, use Yahoo spot + entry logic without option chain
+            spot = get_spot_yahoo(symbol)
+            if spot:
+                atm = round(spot/50)*50
+                if symbol=="BANKNIFTY": atm = round(spot/100)*100
+                # Estimate entry - 1% breakout
+                return (
+                    f"📊 *{index_name}*\n"
+                    f"Spot: {spot:.2f} ATM: {atm}\n\n"
+                    f"⚠️ NSE Option chain blocked, using Spot\n"
+                    f"🟢 BUY {atm} CE if Spot > {round(spot+30,2)}\n"
+                    f"🔴 BUY {atm} PE if Spot < {round(spot-30,2)}\n"
+                    f"SL 35% | Target 40-90%\n\n"
+                    f"✅ Yahoo LIVE"
+                )
+            return f"⏳ {index_name} servers busy - try again in 30 sec /{index_name.lower()}"
 
     except Exception as e:
         print(f"Build error {index_name}: {e}")
-        return f"⏳ {index_name} parsing error - try again /{index_name.lower()}"
+        spot = get_spot_yahoo(symbol)
+        if spot:
+            return f"📊 *{index_name}* Spot: {spot:.2f}\nNSE retrying... /{index_name.lower()}"
+        return f"⏳ {index_name} retrying..."
 
 def send_telegram(text, chat_id=None):
     try:
         cid = chat_id or CHAT_ID
-        if not cid:
-            print("No CHAT_ID")
-            return
+        if not cid: return
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": cid, "text": text, "parse_mode": "Markdown"}
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"TG send error: {e}")
+        requests.post(url, json={"chat_id":cid,"text":text,"parse_mode":"Markdown"}, timeout=10)
+    except: pass
 
 @app.route("/")
-def home():
-    return "Bot Live NSE + Entry Signals V3"
+def home(): return "Bot Live V4 Proxy Fixed"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json()
-        if not data:
-            return "ok"
-        message = data.get("message", {})
-        chat_id = message.get("chat", {}).get("id")
-        text = message.get("text", "").lower()
-
-        if chat_id:
-            os.environ["CHAT_ID"] = str(chat_id)
+        if not data: return "ok"
+        msg = data.get("message",{})
+        chat_id = msg.get("chat",{}).get("id")
+        text = msg.get("text","").lower()
+        if chat_id: os.environ["CHAT_ID"]=str(chat_id)
 
         if "/nifty" in text:
-            msg = build_msg("NIFTY")
-            send_telegram(msg, chat_id)
-        elif "/banknifty" in text or "/bn" in text:
-            msg = build_msg("BANKNIFTY")
-            send_telegram(msg, chat_id)
+            send_telegram(build_msg("NIFTY"), chat_id)
+        elif "/banknifty" in text or text=="/bn":
+            send_telegram(build_msg("BANKNIFTY"), chat_id)
         elif "/sensex" in text:
-            msg = build_msg("SENSEX")
-            send_telegram(msg, chat_id)
+            # Sensex spot via yahoo
+            spot = get_spot_yahoo("SENSEX")
+            send_telegram(f"📊 *SENSEX* Spot: {spot}\nUse /nifty /banknifty for entries", chat_id)
         elif "/start" in text:
-            send_telegram("Welcome Uday!\n/nifty - Nifty with Buy Entry\n/banknifty - BankNifty\nBot is FREE - No Dhan ₹499 needed", chat_id)
-
+            send_telegram("Welcome! /nifty /banknifty - with Buy Entry ✅", chat_id)
         return "ok"
     except Exception as e:
-        print(f"Webhook error: {e}")
+        print(f"Webhook {e}")
         return "ok"
 
+# STOP spam auto messages when failing
 def auto_loop():
     while True:
         try:
+            time.sleep(900) # 15 min only, and only if working
             now = datetime.now()
-            # 9:15 to 15:30 Mon-Fri
-            if now.weekday() < 5 and 9 <= now.hour <= 15:
-                if CHAT_ID and BOT_TOKEN:
-                    if now.minute % 15 == 0: # every 15 min
-                        msg = build_msg("NIFTY")
-                        send_telegram(f"🔔 *15 Min Auto*\n{msg}")
-            time.sleep(60)
-        except Exception as e:
-            print(f"Auto loop error: {e}")
+            if now.weekday()<5 and 9 <= now.hour <= 15 and CHAT_ID:
+                # Only send if data works
+                test = get_nse_data_proxy("NIFTY")
+                if test:
+                    msg = build_msg("NIFTY")
+                    if "⏳" not in msg:
+                        send_telegram(f"🔔 Auto 15m\n{msg}")
+        except:
             time.sleep(60)
 
 threading.Thread(target=auto_loop, daemon=True).start()
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
